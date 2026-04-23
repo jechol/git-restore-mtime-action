@@ -303,6 +303,15 @@ def get_mtime_path(path):
     return os.stat(path, **UTIME_KWS).st_mtime
 
 
+def parse_status(status):
+    """Return git raw status code and optional rename/copy score."""
+    code = status[:1]
+    score = None
+    if code in ('R', 'C') and status[1:].isdigit():
+        score = int(status[1:])
+    return code, score
+
+
 # Git class and parse_log(), the heart of the script ##########################
 
 class Git:
@@ -330,6 +339,8 @@ class Git:
         cmd += ' -m' if merge else ' --no-merges'
         if first_parent:  cmd += ' --first-parent'
         if reverse_order: cmd += ' --reverse'
+        if paths and len(paths) == 1:
+            cmd += ' --follow'
         return self._run(cmd, paths)
 
     def describe(self):
@@ -378,6 +389,7 @@ class Git:
 def parse_log(filelist, dirlist, stats, git, merge=False, filterlist=None):
     mtime = 0
     datestr = isodate(0)
+    tracked = {_: _ for _ in filelist}
     for line in git.log(
             merge,
             args.first_parent,
@@ -412,24 +424,28 @@ def parse_log(filelist, dirlist, stats, git, merge=False, filterlist=None):
         # R099: Renamed (moved), with % of unchanged content. 100 = pure rename
         # Not possible in log: C=Copied, U=Unmerged, X=Unknown, B=pairing Broken
         status = tokens[0].split(' ')[-1]
-        file = tokens[-1]
+        status_code, status_score = parse_status(status)
+        paths = [normalize(_) for _ in tokens[1:]]
+        file = paths[-1]
 
-        # Handles non-ASCII chars and OS path separator
-        file = normalize(file)
-
-        def do_file():
-            if args.skip_older_than_commit and get_mtime_path(file) <= mtime:
+        def do_file(target):
+            fullpath = os.path.join(git.workdir, target)
+            if not os.path.lexists(fullpath):
+                log.warning("WARNING: not found in work tree: %s", target)
+                stats['errors'] += 1
+                return
+            if args.skip_older_than_commit and get_mtime_path(fullpath) <= mtime:
                 stats['skip'] += 1
                 return
             if args.debug:
                 log.debug("%d\t%d\t%d\t%s\t%s",
                           stats['loglines'], stats['commits'], stats['files'],
-                          datestr, file)
+                          datestr, target)
             try:
-                touch(os.path.join(git.workdir, file), mtime)
+                touch(fullpath, mtime)
                 stats['touches'] += 1
             except Exception as e:
-                log.error("ERROR: %s: %s", e, file)
+                log.error("ERROR: %s: %s", e, target)
                 stats['errors'] += 1
 
         def do_dir():
@@ -444,16 +460,32 @@ def parse_log(filelist, dirlist, stats, git, merge=False, filterlist=None):
                 log.error("ERROR: %s: %s", e, dirname)
                 stats['direrrors'] += 1
 
-        if file in filelist:
-            stats['files'] -= 1
-            filelist.remove(file)
-            do_file()
+        # When processing the log from newest to oldest, a pure rename should keep
+        # following the previous path until we find the commit that actually
+        # changed the file contents (or created it).
+        if not args.reverse_order and status_code == 'R' and status_score == 100:
+            oldfile = paths[0]
+            current = tracked.pop(file, None)
+            if current is not None:
+                tracked[oldfile] = current
 
-        if args.dirs and status in ('A', 'D'):
-            dirname = os.path.dirname(file)
-            if dirname in dirlist:
-                dirlist.remove(dirname)
-                do_dir()
+        target = tracked.get(file)
+        if target in filelist and not (not args.reverse_order and status_code == 'R' and status_score == 100):
+            stats['files'] -= 1
+            filelist.remove(target)
+            tracked.pop(file, None)
+            do_file(target)
+
+        if args.dirs:
+            dirpaths = []
+            if status_code in ('A', 'D'):
+                dirpaths = [os.path.dirname(file)]
+            elif status_code == 'R':
+                dirpaths = [os.path.dirname(_) for _ in paths]
+            for dirname in dict.fromkeys(dirpaths):
+                if dirname in dirlist:
+                    dirlist.remove(dirname)
+                    do_dir()
 
         # All files done?
         if not stats['files']:
